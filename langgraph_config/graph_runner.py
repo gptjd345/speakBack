@@ -1,35 +1,42 @@
-from langgraph.graph import StateGraph, MessagesState, START, END
+# 그래프 실행부
+# langgraph_config/graph_runner.py
+from .builder import build_graph
+from .store import global_store
+# 간단한 state 구조 (필요시 MessagesState 써도 됨)
+class PipelineState(dict):
+    pass
 
-def process_input(name: str, audio_file) -> str:
-    """
-    LangGraph 실행: 이름과 오디오 파일 처리
-    audio_file은 Streamlit에서 업로드한 파일 객체(BytesIO 등)
-    """
-    builder = StateGraph(MessagesState)
+def run_pipeline(audio_file, user_name: str, target_text: str):
+    try : 
+        state = {
+            "user_name": user_name,
+            "target_text": target_text,
+        }
+        print("DEBUG inputs:", state)
 
-    def process_node(state: MessagesState):
-        # 파일명 추출 (Streamlit 업로드 객체에는 .name 속성이 있음)
-        audio_name = getattr(state["messages"][-1][1], "name", "uploaded_audio.wav")
-        user_name = state["messages"][-2][1]  # 직전에 들어온 name 값
+        compiled_graph = build_graph()
+        global_store.audio_file = audio_file  # state가 아닌 store에 저장
+        global_store.audio_file.seek(0)  # Whisper 등에서 읽기 위해 포인터 처음으로
+        global_store.target_text = target_text
+
+        print("DEBUG: run_graph 시작")
         
-        return {
-            "messages": [
-                ("ai", f"Name: {user_name}, Audio File: {audio_name} received ✅")
-            ]
+        final_state = compiled_graph.invoke(state)
+
+        # 👇 화면단으로 전달할 데이터 구조 확정
+        result = {
+            "user_name": user_name,
+            "target_text": target_text,
+            "final_state": final_state,          # LangGraph state 결과
+            "us_audio": getattr(global_store, "tts_us_audio", None),  # US 튜터 TTS 음성
+            "uk_audio": getattr(global_store, "tts_uk_audio", None),  # UK 튜터 TTS 음성
+            "us_comment": getattr(global_store, "tts_us_comment", ""), # UK 튜터 피드백
+            "uk_comment": getattr(global_store, "tts_uk_comment", ""), # UK 튜터 피드백
         }
 
-    builder.add_node("process", process_node)
-    
-    builder.add_edge(START, "process")
-    builder.add_edge("process", END)
-
-    graph = builder.compile()
-
-    result = graph.invoke({
-        "messages": [
-            ("user", name),          # 이름
-            ("file", audio_file),    # 업로드된 파일 객체
-        ]
-    })
-    return result["messages"][-1][1]
-
+        print("DEBUG final state:", final_state)
+        print("DEBUG final state:", result)
+        return result
+    except Exception as e:
+        print("DEBUG run_graph error:", e)
+        return {"error": str(e)}

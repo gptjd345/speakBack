@@ -2,8 +2,13 @@ import streamlit as st
 from io import BytesIO
 import base64
 from audiorecorder import audiorecorder
+from langgraph_config.graph_runner import run_pipeline
+from dotenv import load_dotenv
+load_dotenv()  # .env 파일 읽어서 환경변수 자동 등록
 
 st.title("Pronunciation Coach 🎤")
+# Target Text 입력
+target_text = st.text_input("Enter the target sentence (for pronunciation practice)")
 st.write("Upload your voice or record directly for corrections from US & UK tutors.")
 
 # 선택: 업로드 vs 녹음
@@ -63,11 +68,27 @@ with col2:
         audio_file = st.session_state.audio_file
         audio_name = st.session_state.audio_name
 
-        if name and audio_file:
+        if name and target_text and audio_file:
             # 실제 LangGraph 처리 함수 호출 자리
-            result = f"DEBUG: would process {audio_name} for {name}"
+            result = run_pipeline(audio_file, name, target_text)  # 🚀 LangGraph 실행
             st.write("### LangGraph Result")
-            st.success(result)
+            st.json(result) # 결과 dict 보여주기 
+
+            print("Debug run_pipeline : ",result)
+
+            # US TTS 음성 재생
+            us_audio_bytes = result.get("us_audio")
+            if us_audio_bytes:
+                st.audio(us_audio_bytes, format="audio/wav")
+
+            st.write("### UK Tutor Feedback")
+            st.markdown(result.get("uk_comment", "No UK comment available"))
+
+            # UK TTS 음성 재생 (가짜일 경우 빈 바이트 체크)
+            uk_audio_bytes = result.get("uk_audio")
+            if uk_audio_bytes:
+                st.audio(uk_audio_bytes, format="audio/wav")
+
         else:
             st.warning("Please enter your name and upload/record an audio file!")
 
