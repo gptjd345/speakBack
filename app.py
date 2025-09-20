@@ -8,7 +8,10 @@ load_dotenv()  # .env 파일 읽어서 환경변수 자동 등록
 
 st.title("Pronunciation Coach 🎤")
 # Target Text 입력
-target_text = st.text_input("Enter the target sentence (for pronunciation practice)")
+target_text = st.text_area(
+    "Enter the target sentence (for pronunciation practice)",
+    height=300
+)
 st.write("Upload your voice or record directly for corrections from US & UK tutors.")
 
 # 선택: 업로드 vs 녹음
@@ -64,7 +67,10 @@ elif input_method == "Record Audio":
 # ------------------------------
 col1, col2 = st.columns([3, 1])
 with col2:
-    if st.button("Send to LangGraph"):
+    send_clicked = st.button("Send to LangGraph")
+
+# 결과는 전체 폭 컨테이너에서 출력   
+if send_clicked:
         audio_file = st.session_state.audio_file
         audio_name = st.session_state.audio_name
 
@@ -74,7 +80,7 @@ with col2:
             st.write("### LangGraph Result")
             st.json(result) # 결과 dict 보여주기 
 
-            print("Debug run_pipeline : ",result)
+            #print("Debug run_pipeline : ",result)
 
             # US TTS 음성 재생
             us_audio_bytes = result.get("us_audio")

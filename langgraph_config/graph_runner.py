@@ -30,12 +30,17 @@ def run_pipeline(audio_file, user_name: str, target_text: str):
             "final_state": final_state,          # LangGraph state 결과
             "us_audio": getattr(global_store, "tts_us_audio", None),  # US 튜터 TTS 음성
             "uk_audio": getattr(global_store, "tts_uk_audio", None),  # UK 튜터 TTS 음성
-            "us_comment": getattr(global_store, "tts_us_comment", ""), # UK 튜터 피드백
-            "uk_comment": getattr(global_store, "tts_uk_comment", ""), # UK 튜터 피드백
+            "us_feedback": getattr(global_store, "us_feedback", ""), # UK 튜터 피드백
+            "uk_feedback": getattr(global_store, "uk_feedback", ""), # UK 튜터 피드백
+            "score": getattr(global_store, "score", ""), # 점수
+            "target_chunks": getattr(global_store, "target_chunks", ""), # 청크들
+            "user_duration": getattr(global_store, "user_duration", ""), # 청크들
+            "us_ref_duration": getattr(global_store, "us_ref_duration", ""), # 청크들
+
         }
 
         print("DEBUG final state:", final_state)
-        print("DEBUG final state:", result)
+        #print("DEBUG final state:", result)
         return result
     except Exception as e:
         print("DEBUG run_graph error:", e)

@@ -1,8 +1,66 @@
 from .store import global_store
 import re
 from typing import Optional, Dict
-import tempfile
-import difflib
+
+from vosk import Model, KaldiRecognizer
+import wave, json, os
+
+from pydub import AudioSegment
+import io
+import subprocess
+
+# -----------------------------
+# Audio 전처리 (BytesIO → 16kHz mono wav)
+# -----------------------------
+def prepare_audio_for_vosk(org_file_path) -> io.BytesIO:
+    """
+    Streamlit BytesIO / UploadedFile → Vosk에서 쓸 수 있는 16kHz mono wav로 변환
+    """
+    process = subprocess.run(
+        [
+            "ffmpeg",
+            "-i", org_file_path,
+            "-ar", "16000",    # 16kHz
+            "-ac", "1",        # mono
+            "-f", "wav",
+            "pipe:1"
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True
+    )
+    return io.BytesIO(process.stdout)
+
+# -----------------------------
+# Vosk 모델 로드
+# -----------------------------
+VOSK_MODEL_PATH = "vosk-model-small-en-us-0.15"  # 모델 다운로드 후 경로
+if not os.path.exists(VOSK_MODEL_PATH):
+    raise FileNotFoundError("Vosk 모델을 먼저 다운로드하세요!")
+vosk_model = Model(VOSK_MODEL_PATH)
+
+def stt_vosk(user_audio_path: str) :
+    """사용자 음성파일을 Vosk STT로 변환"""
+    audio_stream = prepare_audio_for_vosk(user_audio_path)
+
+    # Vosk recognizer 초기화
+    model = Model(VOSK_MODEL_PATH)
+    rec = KaldiRecognizer(model, 16000)
+    rec.SetWords(True)
+
+    # wav header skip 필요 → wave 모듈 사용 X, raw bytes 그대로 처리
+    while True:
+        data = audio_stream.read(4000)
+        if len(data) == 0:
+            break
+        rec.AcceptWaveform(data)
+
+    result = json.loads(rec.FinalResult())
+    text = result.get("text", "").strip()
+    words = result.get("result", [])  # 단어별 confidence
+
+    conf_dict = {w["word"]: w.get("conf", 0) for w in words}
+    return text, conf_dict
 
 # Try import Coqui TTS (optional)
 try:
@@ -18,6 +76,19 @@ except Exception:
 tts_us_model = TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=False, gpu=False)
 #tts_uk_model = TTS(model_name="tts_models/en/vctk/vits", progress_bar=False, gpu=False)
 
+# 단순 function words 리스트 (빠져도 되는경우가 많은 단어들)
+# 기능어 리스트
+FUNCTION_WORDS = set([
+    "a", "an", "the",
+    "is", "am", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did",
+    "have", "has", "had",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+    "to", "of", "in", "on", "at", "for", "with", "from", "by",
+    "and", "but", "or", "so", "because",
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them"
+])
+
 # 축약(권장) 화이트리스트: 키는 canonical, 값은 허용되는 축약 패턴들(정규표현식)
 CONTRACTION_WHITELIST = {
     "could have": [r"coulda", r"could've", r"could of"],
@@ -32,239 +103,176 @@ CONTRACTION_WHITELIST = {
     "do not": [r"don't", r"dont"],
 }
 
-# 단순 function words 리스트 (빠져도 되는경우가 많은 단어들)
-FUNCTION_WORDS = {
-    "a","an","the","to","of","in","on","at","for","and","but","or","so","if",
-    "is","are","was","were","be","been","being","have","has","had","do","does","did",
-    "that","this","these","those","with","by","as","from","about","into","over","after",
-    "before","between","among","during","until","while","because","since","through"
-}
+def score_content_word(w, user_tokens, conf_dict):
+    """내용어 점수 계산 (가중치↑, confidence 기준↑)"""
+    conf = conf_dict.get(w, 0)
+    if w in user_tokens and conf >= 0.6:
+        return 2.0
+    elif conf >= 0.55:
+        return 1.8
+    elif conf >= 0.4:
+        return 1.6
+    else:
+        return 0.0
 
-# 유틸: 단어 정제
-def tokenize_simple(text: str):
-    text = text.strip().lower()
-    # 따옴표/괄호 제거
-    text = re.sub(r"[\"'()]", "", text)
-    # 하이픈을 공백으로 바꾸기
-    text = re.sub(r"[-/]", " ", text)
-    # 비문자 숫자 제거(단어 내 숫자 유지하려면 수정)
-    tokens = re.findall(r"\b[\w']+\b", text)
-    return tokens
+def score_function_word(w, user_tokens, conf_dict):
+    """기능어 점수 계산 (보너스, confidence 기준↑)"""
+    conf = conf_dict.get(w, 0)
+    gained = 0.0
+    if w in user_tokens:
+        # 축약 확인
+        for base, patterns in CONTRACTION_WHITELIST.items():
+            if w in base.split():
+                if any(re.fullmatch(pat, ut) for ut in user_tokens for pat in patterns):
+                    if conf >= 0.6:
+                        return 2.5
+        if conf >= 0.6:
+            gained = 1.5
+        elif conf >= 0.5:
+            gained = 1.2
+    elif conf >= 0.4:
+        gained = 0.8
+    return gained
 
-def matches_contraction(token: str, canonical_phrase: str) -> bool:
-    token = token.lower()
-    patterns = CONTRACTION_WHITELIST.get(canonical_phrase, [])
+# -----------------------------
+# 간단한 청킹 함수
+# -----------------------------
+def chunk_sentence(text: str):
+    """
+    영어 문장을 원어민 리듬에 맞춰 대략적인 청크 단위로 분리
+    """
+    patterns = [r"\b(and|but|or|so|because)\b",
+                r"\b(could have|would have|should have|going to|want to|let me|give me)\b",
+                r"\b(in|on|at|for|with|from|by|to|of)\b"]
+
+    text = text.lower()
     for p in patterns:
-        if re.fullmatch(p, token):
-            return True
+        text = re.sub(p, r"@@\1@@", text)
+
+    raw_chunks = [c.strip() for c in text.split("@@") if c.strip()]
+    chunks = [re.findall(r"[a-zA-Z']+", c) for c in raw_chunks]
+    return chunks
+
+  
+def check_contraction(user_transcript: str, target_phrase: str) -> bool:
+    """사용자가 허용된 축약형을 썼는지 확인"""
+    if target_phrase in CONTRACTION_WHITELIST:
+        for pattern in CONTRACTION_WHITELIST[target_phrase]:
+            if re.search(pattern, user_transcript, re.IGNORECASE):
+                return True
     return False
 
-def is_function_word(token: str) -> bool:
-    return token.lower() in FUNCTION_WORDS
+# -----------------------------
+# TTS 생성 (길이 포함)
+# -----------------------------
+def tts_generate_us(text: str) -> bytes:
+    """US tutor TTS → wav 바이트 리턴"""
+    wav_path = "reference_us.wav"
+    tts_us_model.tts_to_file(text=text, file_path=wav_path)
+    with open(wav_path, "rb") as f:
+        wav_bytes = f.read()
 
-def _segment_confidence_hint(asr_result: dict) -> Optional[float]:
-    """
-    asr_result 는 whisper.transcribe(...) 의 결과(사전)라고 가정.
-    segments 가 있으면 각 segment의 avg_logprob 값을 사용해 proxy confidence 계산.
-    (단순히 평균 - 클수록 신뢰)
-    """
-    try:
-        segs = asr_result.get("segments", [])
-        if not segs:
-            return None
-        avg = sum((s.get("avg_logprob", 0.0) or 0.0) for s in segs) / len(segs)
-        # avg_logprob는 음수(높을수록 0에 가깝다). 그대로 반환
-        return avg
-    except Exception:
-        return None
+    seg = AudioSegment.from_file(io.BytesIO(wav_bytes), format="wav")
+    duration_sec = len(seg) / 1000.0
+
+    return wav_bytes, duration_sec
     
-def generate_tts_bytes(text: str, voice: str = "us") -> bytes:
+# -----------------------------
+# Audio duration helper
+# -----------------------------
+def get_audio_duration(file_path: str) -> float:
+    """wav 파일 길이(초)"""
+    with wave.open(file_path, "rb") as wf:
+        frames = wf.getnframes()
+        rate = wf.getframerate()
+        return frames / float(rate)   
+
+def evaluate_pronunciation(target_text: str, user_audio_path: str, tutor_type: str = "us"):
     """
-    Coqui TTS 사용시 파일을 tmp로 만들고 바이트를 읽어서 반환.
-    voice 인자는 향후 다중 목소리 선택용 placeholder.
+    전체 흐름: 사용자 오디오 → STT → 발음 평가 → 결과 반환
     """
-    if not TTS_AVAILABLE:
-        return b""  # placeholder: 사용시엔 빈 바이트가 아닌 경고/플레이스홀더를 쓸 수 있음
+    # 1) 튜터 참조 음성, 튜터 음성시간
+    ref_audio,ref_duration = tts_generate_us(target_text) if tutor_type == "us" else None
 
-    tts = tts_us_model
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp_path = tmp.name
-    # TTS 라이브러리의 tts_to_file 사용
-    tts.tts_to_file(text=text, file_path=tmp_path)
-    with open(tmp_path, "rb") as f:
-        data = f.read()
-    return data    
+    # 2) 사용자 음성 → STT
+    user_transcript, conf_dict = stt_vosk(user_audio_path)
+    user_tokens = re.findall(r"[a-zA-Z']+", user_transcript.lower())
+    user_seg = AudioSegment.from_file(user_audio_path)
+    # 사용자발화시간
+    user_duration = len(user_seg) / 1000.0
 
-# pronunciation_module.py
-def evaluate_pronunciation(target_text: str, asr_text: str, asr_result: Optional[dict] = None) -> Dict:
-    """
-    메인 평가 함수
-    - target_text: 사용자가 말하려던 문장
-    - asr_text: ASR이 출력한 텍스트 (string)
-    - asr_result: optional full ASR result dict (whisper result) -> confidence hint 사용
-    반환:
-        {
-          "comment": str,
-          "highlights": [ { "type":"missing|mismatch|ok|contraction", "target":..., "asr":... } ... ],
-          "tts_audio": bytes
-        }
-    동작 요약:
-      1) 단어 토큰화
-      2) difflib로 align -> mismatch/missing 추출
-      3) function word 여부로 중요도 결정
-      4) contraction whitelist 허용/칭찬
-      5) segment-level avg_logprob(옵션)으로 불확실성 반영
-      6) TTS 생성(가능하면)
-    """
-   
-    tgt_tokens = tokenize_simple(target_text)
-    asr_tokens = tokenize_simple(asr_text or "")
+    # 3) 청크화
+    target_chunks = chunk_sentence(target_text)
+    
 
-    # alignment: sequence matcher produces opcodes
-    sm = difflib.SequenceMatcher(a=tgt_tokens, b=asr_tokens)
-    ops = sm.get_opcodes() # 양쪽이 얼마나 다른지를 비교해줌
+    feedback = []
+    score = 0
+    total = 0
 
-    highlights = []
-    critical_issues = []
-    minor_issues = []
+    # 4) 청크 비교
+    for chunk in target_chunks:
+        total += 2
+        content_words = [w for w in chunk if w not in FUNCTION_WORDS and len(w) > 1]
+        function_words = list(dict.fromkeys([w for w in chunk if w in FUNCTION_WORDS]))  # 중복 제거
 
-    # confidence proxy (avg_logprob); 작을수록 덜 신뢰(whisper 음성 log prob는 음수)
-    seg_conf = _segment_confidence_hint(asr_result)
-
-    for tag, i1, i2, j1, j2 in ops:
-        # tag: 'equal', 'replace', 'delete', 'insert'
-        tgt_chunk = tgt_tokens[i1:i2]
-        asr_chunk = asr_tokens[j1:j2]
-        if tag == "equal":
-            for w in tgt_chunk:
-                highlights.append({"type":"ok", "target":w, "asr":w})
-            continue
-
-        if tag == "replace":
-            # target replaced by asr: could be contraction or mispronounce
-            for tw, aw in zip(tgt_chunk, asr_chunk):
-                # contraction check: if asr token matches allowed contraction for this tgt_chunk phrase
-                combined_tgt = " ".join([tw])  # for single-word replacement, still works
-                # check canonical phrases of length 2 as well (maybe target was two-word)
-                contraction_matched = False
-                # try two-word canonical if exists
-                if (i1+1)<len(tgt_tokens):
-                    two = tgt_tokens[i1:i1+2]
-                    canonical2 = " ".join(two)
-                    if matches_contraction(aw, canonical2):
-                        highlights.append({"type":"contraction", "target":canonical2, "asr":aw})
-                        contraction_matched = True
-                if not contraction_matched and matches_contraction(aw, tw):
-                    highlights.append({"type":"contraction", "target":tw, "asr":aw})
-                    contraction_matched = True
-
-                if contraction_matched:
-                    # contraction is encouraged
-                    continue
-
-                # otherwise determine importance
-                if is_function_word(tw):
-                    highlights.append({"type":"minor_mismatch", "target":tw, "asr":aw})
-                    minor_issues.append((tw, aw))
-                else:
-                    highlights.append({"type":"mismatch", "target":tw, "asr":aw})
-                    critical_issues.append((tw, aw))
-
-            # if lengths differ, note remaining
-            if len(tgt_chunk) > len(asr_chunk):
-                # some target words deleted/omitted
-                omitted = tgt_chunk[len(asr_chunk):]
-                for w in omitted:
-                    if is_function_word(w):
-                        highlights.append({"type":"ok_omitted", "target":w, "asr":""})
-                    else:
-                        highlights.append({"type":"missing", "target":w, "asr":""})
-                        critical_issues.append((w, ""))
-            elif len(asr_chunk) > len(tgt_chunk):
-                extra = asr_chunk[len(tgt_chunk):]
-                for w in extra:
-                    highlights.append({"type":"extra", "target":"", "asr":w})
-                    minor_issues.append(("", w))
-
-        elif tag == "delete":
-            # target words deleted in ASR
-            for w in tgt_chunk:
-                if is_function_word(w):
-                    highlights.append({"type":"ok_omitted", "target":w, "asr":""})
-                else:
-                    highlights.append({"type":"missing", "target":w, "asr":""})
-                    critical_issues.append((w, ""))
-        elif tag == "insert":
-            # ASR inserted words not in target (probably filler/recognition artifact)
-            for w in asr_chunk:
-                highlights.append({"type":"extra", "target":"", "asr":w})
-                minor_issues.append(("", w))
-
-    # Build human-readable comment with soft rules:
-    comment_lines = []
-
-    # If no critical issues -> praise
-    if not critical_issues:
-        comment_lines.append("Good — your message is understandable.")
-    else:
-        # list up to 3 critical items
-        sample = critical_issues[:3]
-        for t, a in sample:
-            if a == "":
-                comment_lines.append(f"The word **'{t}'** was not clearly heard — try to pronounce it a bit more distinctly.")
+        # 내용어 평가
+        for w in content_words:
+            total += 2.0  # 기준점수는 그대로
+            gained = score_content_word(w, user_tokens, conf_dict)
+            score += gained
+            if gained == 2.0:
+                feedback.append(f"내용어 '{w}'는 분명히 잘 들렸어요 👍")
+            elif gained >= 1.5:
+                feedback.append(f"내용어 '{w}'는 대체로 좋았지만 조금 더 또렷하면 완벽해요.")
+            elif gained >= 1.0:
+                feedback.append(f"내용어 '{w}'는 들리긴 했지만 약했어요.")
             else:
-                comment_lines.append(f"It sounds like you said **'{a}'** instead of **'{t}'** — check that word.")
-        # add general hint
-        comment_lines.append("Focus on pronouncing content words (nouns/verbs) clearly; function words can be reduced.")
+                feedback.append(f"내용어 '{w}' 발음을 놓친 것 같아요.")
 
-    # Mention contractions preference
-    # If we detected contraction highlights, praise
-    contractions_found = [h for h in highlights if h["type"] == "contraction"]
-    if contractions_found:
-        comment_lines.append("Nice natural contractions detected — in casual speech, contractions help flow. Keep it.")
+        # 기능어 평가
+        for w in function_words:
+            gained = score_function_word(w, user_tokens, conf_dict)
+            score += gained
+            if gained >= 0.8:
+                feedback.append(f"'{w}'를 축약해서 자연스럽게 말했네요 👌")
+            elif gained >= 0.5:
+                feedback.append(f"기능어 '{w}'는 무난히 발음했어요.")
+            elif gained > 0:
+                feedback.append(f"기능어 '{w}'는 조금 약했어요.")
+            else:
+                feedback.append(f"기능어 '{w}' 발음이 거의 안 들렸어요.")
+    
+    # 5) 속도 보너스 (20%)
+    if user_duration <= ref_duration + 5:
+        bonus = (score / total) * 0.2
+        score += bonus
+        feedback.append("⏱️ 발화 속도가 자연스러워서 추가 점수를 드립니다!")
 
-    # If segment-level avg_logprob is very low, warn about overall clarity (low confidence)
-    if seg_conf is not None:
-        # seg_conf is avg_logprob (negative). Closer to 0 is better, very negative is bad.
-        if seg_conf < -3.0:
-            comment_lines.append("Audio was a bit unclear (low ASR confidence). Try speaking a bit louder or with less background noise.")
-        elif seg_conf < -1.8:
-            comment_lines.append("Some parts had low confidence — re-recording might help for clearer feedback.")
+    print("DEBUG total",total)
+    print("DEBUG score",score)
+    percentage = round((score / total) * 100, 1)
 
-    # Final comment
-    final_comment = " ".join(comment_lines)
-
-    # TTS generation: create tutor audio for the canonical target_text but prefer contraction suggestions:
-    # If contractions were found, use ASR text (to preserve student's chosen contraction) else use target_text
-    tts_input_text = None
-    if contractions_found:
-        # use asr_text to keep student's contraction style, but ensure not empty
-        tts_input_text = asr_text if asr_text.strip() else target_text
-    else:
-        # encourage contraction: try to produce a contracted version of target_text by replacing known phrases
-        contracted = target_text
-        for canonical, patterns in CONTRACTION_WHITELIST.items():
-            pat = re.compile(r"\b" + re.escape(canonical) + r"\b", flags=re.IGNORECASE)
-            # replace canonical phrase by its first whitelist short form if exists
-            if pat.search(contracted):
-                replacement = patterns[0]  # take first contraction suggestion (e.g., coulda)
-                contracted = pat.sub(replacement, contracted)
-        # prefer contracted if different
-        tts_input_text = contracted if contracted != target_text else target_text
-
-    # Generate TTS bytes (try Coqui)
-    try:
-        tts_bytes = generate_tts_bytes(tts_input_text, voice="us")
-    except Exception:
-        tts_bytes = b""
+    # 최종 결과
+    result = {
+        "score": percentage,
+        "feedback": feedback,
+        "target_chunks": target_chunks,
+        "reference_tts": ref_audio,   # US tutor 음성 (wav 바이트)
+        "user_transcript": user_transcript,
+        "user_duration": user_duration,
+        "ref_duration": ref_duration
+    }
+    return result
 
     # store into global_store as well (synchronized)
     global_store.tts_us_comment = final_comment
     global_store.tts_us_audio = tts_bytes
 
+"""
     out = {
         "comment": final_comment,
         "highlights": highlights,
         "tts_audio": tts_bytes
     }
     return out
+"""

@@ -5,22 +5,19 @@ class GlobalStore:
         self.audio_file = None    # BytesIO 같은 파일 객체
 
         # 마이크 입력시 샘플링 주파수 32khz, 이고 whisper읽을때 16khz라 어차피 다시 샘플링해야함 
-        #self.audio_np = None      # numpy array로 변환된 오디오
-        # samplerate : 오디오 데이터를 초당 몇 개의 샘플로 쪼개서 기록했는지 나타냄
-        #self.audio_sr = None      # 일반적인 음성 오디오는 16,000 Hz (16kHz)
-        #self.audio_tensor = None  # tensor로 변경한 오디오
         self.tmp_path = None       # 원본파일 저장위치
 
         self.user_name = None      # 사용자 정보
         # 필요하면 더 추가 (예: 세션 ID 등)
 
-        self.stt_text = None       # 사용자음성 데이터를 AI 가 텍스트화 한 참고데이터
-        self.us_asr_result = None  # us asr 결과 분석
-        self.uk_asr_result = None  # uk asr 결과 분석
+        self.score = None # score
+        self.us_feedback = None # us_feedback
+        self.tts_us_audio = None # reference 참고용 음성
+        self.user_transcript = None # user_transcript
+        self.target_chunks = None # target 의 청크 묶음
 
-        self.tts_us_audio = None   # us tutor 가 만든 교정데이터
-        self.tts_us_comment = None # us tutor 가 만든 교정데이터
-        self.us_highlights = None # us tutor의 하이라이트 
+        self.user_duration = None # 사용자 발화 시간
+        self.us_ref_duration = None  # us tutor 발화시간
 
         self.tts_uk_audio = None   # uk tutor 가 만든 교정데이터
         self.tts_uk_comment = None # uk tutor 가 만든 교정데이터

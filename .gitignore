@@ -220,3 +220,6 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
+# Vosk model files
+vosk-model-small-en-us-0.15.zip
+vosk-model-small-en-us-0.15/

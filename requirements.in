@@ -6,3 +6,4 @@ numpy<=2.2.0
 soundfile
 TTS
 python-dotenv
+vosk
